@@ -137,7 +137,7 @@ gstack/
 ├── setup            # One-time setup: build binary + symlink skills
 ├── SKILL.md         # Generated from SKILL.md.tmpl (don't edit directly)
 ├── SKILL.md.tmpl    # Template: edit this, run gen:skill-docs
-├── ETHOS.md         # Builder philosophy (Boil the Lake, Search Before Building)
+├── ETHOS.md         # Builder philosophy (Boil the Ocean, Search Before Building)
 └── package.json     # Build scripts for browse
 ```
 
@@ -417,6 +417,44 @@ tracked by git due to a historical mistake and should eventually be removed with
 because they're tracked despite `.gitignore` — ignore them. When staging files,
 always use specific filenames (`git add file1 file2`) — never `git add .` or
 `git add -A`, which will accidentally include the binaries.
+
+## Redaction guard (PII / secrets / legal content)
+
+Shared redaction engine catches credentials, PII, and legal/damaging content
+before it reaches an external sink (codex dispatch, GitHub issue/PR body, pushed
+commit). It is a **guardrail, not airtight enforcement** — `git push --no-verify`,
+direct `gh issue create`, and `GSTACK_REDACT_PREPUSH=skip` all bypass it. It
+catches accidents and carelessness, the 99% case. Do not claim it stops a
+determined leaker (a CHANGELOG line that does would fail a hostile screenshotter).
+
+- **Engine + taxonomy:** `lib/redact-patterns.ts` (the single source of truth —
+  3 tiers; HIGH = genuinely-secret credentials that block, MEDIUM = PII/legal/
+  internal + high-FP credential shapes that confirm via AskUserQuestion, LOW =
+  FYI) and `lib/redact-engine.ts` (pure `scan()` + `applyRedactions()`).
+  Calibration matters: a gate that cries wolf gets ignored, so context-variable
+  shapes (Stripe `pk_live_`, Google `AIza`, JWT, env `*_KEY=`) sit at MEDIUM.
+- **CLI:** `bin/gstack-redact` (exit 0 clean / 2 MEDIUM / 3 HIGH; `--json`,
+  `--auto-redact`, `--repo-visibility`, `--from-file`). `bin/gstack-redact-prepush`
+  is the opt-in git hook.
+- **Skill docs are generated** from `scripts/resolvers/redact-doc.ts`
+  (`{{REDACT_TAXONOMY_TABLE}}`, `{{REDACT_INVOCATION_BLOCK:<sink>}}`) so /spec,
+  /cso, /ship, /document-release, /document-generate never drift from the engine.
+- **Scan-at-sink:** always scan the EXACT bytes that will be sent — write to a
+  temp file, scan that file, pass the SAME file to `gh`/`git`. Never scan a string
+  then re-render (that reopens a scan-vs-send gap).
+- **Visibility (no tier promotion):** resolve once per run, order = local config
+  (`gstack-config get redact_repo_visibility`, ~/.gstack so never committed) → gh
+  → glab → unknown(=public-strict). Public repos get STERNER per-finding
+  confirmation (no batch-acknowledge, no silent-proceed); MEDIUM is never
+  auto-promoted to HIGH.
+- **Tool-attributed fences:** wrap Codex/Greptile/eval output in ` ```codex-review `
+  / ` ```greptile ` fences so example credentials those tools quote WARN-degrade
+  instead of blocking. A live-format credential inside the fence still blocks.
+- **Config keys:** `redact_repo_visibility` (public|private|unknown, local-only
+  override for repos gh/glab can't read), `redact_prepush_hook` (true|false).
+  There is intentionally NO key to disable HIGH blocking.
+- **Audit:** the /spec semantic pass appends a content-free record (categories +
+  body sha256, no spec text) to `~/.gstack/security/semantic-reviews.jsonl` (0600).
 
 ## Commit style
 
@@ -738,8 +776,10 @@ When estimating or discussing effort, always show both human-team and CC+gstack 
 | Research / exploration | 1 day | 3 hours | ~3x |
 
 Completeness is cheap. Don't recommend shortcuts when the complete implementation
-is a "lake" (achievable) not an "ocean" (multi-quarter migration). See the
-Completeness Principle in the skill preamble for the full philosophy.
+is achievable. Boil the ocean — the complete thing is the goal; only genuinely
+unrelated multi-quarter migrations are separate scope, never an excuse for a
+shortcut. See the Completeness Principle in the skill preamble for the full
+philosophy.
 
 ## Search before building
 
@@ -865,6 +905,31 @@ Key routing rules:
 - Save progress → invoke /context-save
 - Resume context → invoke /context-restore
 
+## Cross-session decision memory
+
+Durable decisions and their rationale are captured in an append-only, event-sourced
+store at `~/.gstack/projects/<slug>/decisions.jsonl` so neither you nor the user
+re-litigates a settled call or loses the "why" across sessions. This is the reliable,
+file-only path: it works with gbrain OFF. (gbrain semantic recall is an optional
+enhancement layered on top, never a dependency.)
+
+- **Resurface** active decisions before re-deciding: `bin/gstack-decision-search`
+  (`--recent N`, `--scope repo|branch|issue`, `--query KW`, `--all`, `--json`).
+  Add `--semantic` (with `--query`) to append related hits from gbrain memory when
+  it's up; it degrades silently to the reliable file results when gbrain is off.
+  Session start already surfaces scope-relevant active decisions via Context Recovery.
+  If a decision is listed, treat it as settled with its rationale; if you're about to
+  reverse it, say so explicitly.
+- **Capture** a DURABLE decision when you or the user make one:
+  `bin/gstack-decision-log '{"decision":"...","rationale":"...","scope":"repo|branch|issue","source":"user|skill|agent","confidence":1-10}'`.
+  Reverse a prior call with `--supersede <id>`; expunge an accidental secret with
+  `--redact <id>`; rewrite the log to the active set with `--compact`. Non-interactive
+  (never prompts), injection-sanitized, and HIGH-secret-blocking on write.
+- **Durable means:** architecture choice, scope cut, tool/vendor choice, or a reversal
+  of a prior call. NOT a turn-level edit, a phrasing tweak, or anything trivially
+  re-derivable. Capture is curated at the source — log durable decisions only, or the
+  store becomes noise.
+
 ## GBrain Search Guidance (configured by /sync-gbrain)
 <!-- gstack-gbrain-search-guidance:start -->
 
@@ -899,5 +964,11 @@ Grep is still right for known exact strings, regex, multiline patterns, and
 file globs. Run `/sync-gbrain` after meaningful code changes; for ongoing
 auto-sync across all worktrees, run `gbrain autopilot --install` once per
 machine — gbrain's daemon handles incremental refresh on a schedule.
+
+Safety: don't run `/sync-gbrain` while `gbrain autopilot` is active — the
+orchestrator refuses destructive source ops when it detects a running autopilot
+to avoid racing it (#1734). Prefer registering user repos with `gbrain sources
+add --path <dir>` (no `--url`): URL-managed sources can auto-reclone, and the
+sync code walk for them requires an explicit `--allow-reclone` opt-in.
 
 <!-- gstack-gbrain-search-guidance:end -->

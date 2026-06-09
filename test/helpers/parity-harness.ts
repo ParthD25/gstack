@@ -22,6 +22,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { ParityBaseline, SkillBaselineEntry } from './capture-parity-baseline';
 import { captureBaseline } from './capture-parity-baseline';
+import { CARVE_GUARDS } from './carve-guards';
 
 export interface ParityInvariant {
   skill: string;
@@ -33,12 +34,57 @@ export interface ParityInvariant {
   maxSizeRatio?: number;
   /** Minimum byte size (catches over-stripping cliffs). */
   minBytes?: number;
+  /**
+   * Carved skill (v2 plan T9): the skill is a skeleton SKILL.md plus on-demand
+   * sections/*.md. When true:
+   *  - mustContain / mustHaveHeadings run against skeleton + ALL sections unioned,
+   *    so a phrase that moved into a section still counts (content preserved, just
+   *    relocated — that's the whole point of the carve).
+   *  - minBytes / maxSizeRatio run against the UNION bytes, not the skeleton alone
+   *    (total behavior must not shrink; the win is what's no longer always-loaded,
+   *    which the union size deliberately does NOT measure — maxSkeletonBytes does).
+   *  - maxSkeletonBytes asserts the always-loaded skeleton actually shrank.
+   * Without this, lowering minBytes to fit a 65KB skeleton would make the size
+   * floor toothless (Codex outside-voice #12).
+   */
+  sectioned?: boolean;
+  /** Max bytes for the always-loaded skeleton SKILL.md (carved skills only). */
+  maxSkeletonBytes?: number;
 }
 
 export interface ParityCheckResult {
   skill: string;
   passed: boolean;
   failures: string[];
+}
+
+/**
+ * Read a skill's check text + sizes. For a carved skill, union the skeleton with
+ * every sections/*.md so relocated content still counts and the union size
+ * measures total preserved behavior; skeletonBytes is reported separately so the
+ * always-loaded shrink can be asserted. For a monolith, text == skeleton.
+ */
+export function readSkillForParity(
+  repoRoot: string,
+  skill: string,
+  sectioned: boolean,
+): { text: string; unionBytes: number; skeletonBytes: number } {
+  const skeleton = fs.readFileSync(path.join(repoRoot, skill, 'SKILL.md'), 'utf-8');
+  const skeletonBytes = Buffer.byteLength(skeleton, 'utf-8');
+  if (!sectioned) return { text: skeleton, unionBytes: skeletonBytes, skeletonBytes };
+
+  let text = skeleton;
+  let unionBytes = skeletonBytes;
+  const sectionsDir = path.join(repoRoot, skill, 'sections');
+  if (fs.existsSync(sectionsDir)) {
+    for (const f of fs.readdirSync(sectionsDir).sort()) {
+      if (!f.endsWith('.md')) continue;
+      const sec = fs.readFileSync(path.join(sectionsDir, f), 'utf-8');
+      text += '\n' + sec;
+      unionBytes += Buffer.byteLength(sec, 'utf-8');
+    }
+  }
+  return { text, unionBytes, skeletonBytes };
 }
 
 export function checkSkillParity(
@@ -48,38 +94,54 @@ export function checkSkillParity(
   repoRoot: string,
 ): ParityCheckResult {
   const failures: string[] = [];
+  const needText = !!(invariant.mustContain?.length || invariant.mustHaveHeadings?.length);
 
-  // SIZE checks
+  // Resolve the text + size to check against. Carved skills union skeleton +
+  // sections; monoliths use the skeleton alone. Read on demand so size-only
+  // invariants don't pay for a file read they don't need (monolith path).
+  let checkText: string | null = null;
+  let checkBytes = current.skillMdBytes;
+  if (invariant.sectioned) {
+    try {
+      const r = readSkillForParity(repoRoot, invariant.skill, true);
+      checkText = r.text;
+      checkBytes = r.unionBytes;
+      if (invariant.maxSkeletonBytes !== undefined && r.skeletonBytes > invariant.maxSkeletonBytes) {
+        failures.push(`skeleton ${r.skeletonBytes} > maxSkeletonBytes ${invariant.maxSkeletonBytes}`);
+      }
+    } catch (err) {
+      failures.push(`cannot read carved skill ${invariant.skill}: ${(err as Error).message}`);
+    }
+  } else if (needText) {
+    try {
+      checkText = fs.readFileSync(path.join(repoRoot, invariant.skill, 'SKILL.md'), 'utf-8');
+    } catch (err) {
+      failures.push(`cannot read ${path.join(repoRoot, invariant.skill, 'SKILL.md')}: ${(err as Error).message}`);
+    }
+  }
+
+  // SIZE checks (union bytes for carved skills, skeleton bytes for monoliths)
   if (invariant.maxSizeRatio !== undefined && baseline) {
-    const ratio = current.skillMdBytes / baseline.skillMdBytes;
+    const ratio = checkBytes / baseline.skillMdBytes;
     if (ratio > invariant.maxSizeRatio) {
       failures.push(`size ratio ${ratio.toFixed(3)} > maxSizeRatio ${invariant.maxSizeRatio}`);
     }
   }
-  if (invariant.minBytes !== undefined && current.skillMdBytes < invariant.minBytes) {
-    failures.push(`size ${current.skillMdBytes} < minBytes ${invariant.minBytes}`);
+  if (invariant.minBytes !== undefined && checkBytes < invariant.minBytes) {
+    failures.push(`size ${checkBytes} < minBytes ${invariant.minBytes}`);
   }
 
-  // CONTENT checks (read live file for fresh content)
-  if (invariant.mustContain?.length || invariant.mustHaveHeadings?.length) {
-    const skillMdPath = path.join(repoRoot, invariant.skill, 'SKILL.md');
-    let content: string | null = null;
-    try {
-      content = fs.readFileSync(skillMdPath, 'utf-8');
-    } catch (err) {
-      failures.push(`cannot read ${skillMdPath}: ${(err as Error).message}`);
-    }
-    if (content) {
-      const lower = content.toLowerCase();
-      for (const phrase of invariant.mustContain ?? []) {
-        if (!lower.includes(phrase.toLowerCase())) {
-          failures.push(`missing required phrase: "${phrase}"`);
-        }
+  // CONTENT checks
+  if (needText && checkText !== null) {
+    const lower = checkText.toLowerCase();
+    for (const phrase of invariant.mustContain ?? []) {
+      if (!lower.includes(phrase.toLowerCase())) {
+        failures.push(`missing required phrase: "${phrase}"`);
       }
-      for (const heading of invariant.mustHaveHeadings ?? []) {
-        if (!content.includes(heading)) {
-          failures.push(`missing required heading: "${heading}"`);
-        }
+    }
+    for (const heading of invariant.mustHaveHeadings ?? []) {
+      if (!checkText.includes(heading)) {
+        failures.push(`missing required heading: "${heading}"`);
       }
     }
   }
@@ -137,61 +199,13 @@ export function runParityChecks(opts: {
  * Each entry pins what must-not-break in a skill family. Extend as future
  * skills land. Phase B (v2.0.0.0) adds LLM-judge invariants on top of these.
  */
-export const PARITY_INVARIANTS: ParityInvariant[] = [
-  {
-    skill: 'cso',
-    mustContain: ['OWASP', 'STRIDE', 'daily', 'comprehensive', 'verif'],
-    mustHaveHeadings: ['## Preamble', '## When to invoke'],
-    maxSizeRatio: 1.05,
-    minBytes: 30_000,
-  },
-  {
-    skill: 'ship',
-    mustContain: [
-      'VERSION',
-      'CHANGELOG',
-      'review',
-      'merge',
-      'PR',
-    ],
-    mustHaveHeadings: ['## Preamble', '## When to invoke'],
-    maxSizeRatio: 1.05,
-    minBytes: 80_000,
-  },
-  {
-    skill: 'plan-ceo-review',
-    mustContain: [
-      'SCOPE EXPANSION',
-      'SELECTIVE EXPANSION',
-      'HOLD SCOPE',
-      'SCOPE REDUCTION',
-    ],
-    mustHaveHeadings: ['## Preamble', '## When to invoke'],
-    maxSizeRatio: 1.05,
-    minBytes: 80_000,
-  },
-  {
-    skill: 'plan-eng-review',
-    mustContain: [
-      'Architecture',
-      'Code Quality',
-      'Test',
-      'Performance',
-    ],
-    mustHaveHeadings: ['## Preamble', '## When to invoke'],
-    maxSizeRatio: 1.05,
-    minBytes: 70_000,
-  },
-  {
-    skill: 'plan-design-review',
-    mustContain: [
-      'design',
-      'visual',
-    ],
-    mustHaveHeadings: ['## Preamble', '## When to invoke'],
-    maxSizeRatio: 1.05,
-    minBytes: 70_000,
-  },
+/**
+ * Monolith (non-carved) invariants — hand-written. Carved-skill invariants are
+ * generated from CARVE_GUARDS below (single source of truth), so they never drift
+ * from the size-budget / static / behavioral guards.
+ */
+const MONOLITH_INVARIANTS: ParityInvariant[] = [
+  // cso is now carved — its invariant is generated from CARVE_GUARDS below.
   {
     skill: 'review',
     mustContain: ['confidence', 'P1', 'P2'],
@@ -210,15 +224,11 @@ export const PARITY_INVARIANTS: ParityInvariant[] = [
     skill: 'investigate',
     mustContain: ['root cause', 'hypothes'],
     mustHaveHeadings: ['## Preamble', '## When to invoke'],
-    maxSizeRatio: 1.05,
+    // Cross-cutting preamble growth (v1.57.2.0 AUQ-failure prose fallback ~2KB + the
+    // cross-session decision-memory nudge) lands this skill just over the strict 1.05;
+    // headroom for the shared preamble additions (matches the carved-skill overrides).
+    maxSizeRatio: 1.07,
     minBytes: 30_000,
-  },
-  {
-    skill: 'office-hours',
-    mustContain: ['design doc', 'problem statement'],
-    mustHaveHeadings: ['## Preamble', '## When to invoke'],
-    maxSizeRatio: 1.05,
-    minBytes: 70_000,
   },
   {
     skill: 'autoplan',
@@ -227,4 +237,28 @@ export const PARITY_INVARIANTS: ParityInvariant[] = [
     maxSizeRatio: 1.05,
     minBytes: 70_000,
   },
+];
+
+/**
+ * Carved-skill invariants, GENERATED from the canonical CARVE_GUARDS registry
+ * (EQ1: single source of truth). Each carve's skeleton-shrink floor
+ * (maxSkeletonBytes), union floor (minUnionBytes), and content invariants
+ * (mustContain) live in carve-guards.ts; this just projects them into the parity
+ * shape. Adding a carve there auto-adds its union guard here — which is how
+ * plan-devex-review (previously in SECTIONS_EXTRACTED but missing a sectioned
+ * parity invariant) is now guarded.
+ */
+const CARVED_INVARIANTS: ParityInvariant[] = Object.values(CARVE_GUARDS).map((g) => ({
+  skill: g.skill,
+  sectioned: true,
+  maxSkeletonBytes: g.maxSkeletonBytes,
+  minBytes: g.minUnionBytes,
+  mustContain: g.mustContain,
+  mustHaveHeadings: ['## Preamble', '## When to invoke'],
+  maxSizeRatio: g.maxSizeRatio ?? 1.05,
+}));
+
+export const PARITY_INVARIANTS: ParityInvariant[] = [
+  ...MONOLITH_INVARIANTS,
+  ...CARVED_INVARIANTS,
 ];
